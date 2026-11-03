@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HerdSense</title>
+<style>
+  :root { --bg:#fff; --fg:#1d1d1f; --muted:#6b6b70; --card:#f5f5f7; --line:#dcdce0;
+          --ok:#1d9e75; --warn:#d98a00; --bad:#d64545; --off:#8a8a90; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#17171a; --fg:#ececef; --muted:#9a9aa2; --card:#222226; --line:#34343a;
+            --ok:#3ec79a; --warn:#f0a93a; --bad:#f06a6a; --off:#8a8a92; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg);
+         font:15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  h1 { font-size:20px; margin:0 0 12px; }
+  h2 { font-size:14px; margin:0 0 8px; color:var(--muted); font-weight:600; }
+  .bar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:12px; }
+  input { padding:6px 10px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); min-width:220px; }
+  button { padding:6px 14px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); cursor:pointer; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--off); display:inline-block; }
+  .banner { display:none; padding:8px 12px; border-radius:6px; background:var(--card); border:1px solid var(--warn); margin-bottom:12px; }
+  .grid { display:grid; grid-template-columns:minmax(0,1.3fr) minmax(0,1fr); gap:16px; }
+  @media (max-width:760px) { .grid { grid-template-columns:1fr; } }
+  .card { background:var(--card); border-radius:10px; padding:12px; margin-bottom:16px; }
+  .scroll { overflow-x:auto; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--muted); font-weight:600; font-size:13px; }
+  .badge { padding:2px 8px; border-radius:10px; color:#fff; font-size:12px; font-weight:600; }
+  ul { list-style:none; margin:0; padding:0; max-height:260px; overflow-y:auto; }
+  li { padding:6px 0; border-bottom:1px solid var(--line); font-size:14px; }
+  li small { color:var(--muted); margin-right:6px; }
+  li.warn { color:var(--bad); font-weight:600; }
+  .empty { color:var(--muted); }
+  svg text { fill:var(--fg); font-size:11px; }
+</style>
+</head>
+<body>
+<h1>HerdSense</h1>
+<div class="bar">
+  <input id="group" placeholder="GROUP_ID">
+  <button id="go">Connect</button>
+  <span><span class="dot" id="conn"></span> <span id="connText">disconnected</span></span>
+</div>
+<div class="banner" id="banner">No updates from the detector. Is detector.py running?</div>
+<div class="grid">
+  <div>
+    <div class="card"><h2>Members</h2><div class="scroll"><table>
+      <thead><tr><th>Member</th><th>Status</th><th>Nearest groupmate</th><th>Motion</th><th>GPS acc.</th><th>Seen</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="6" class="empty">Waiting for data...</td></tr></tbody>
+    </table></div></div>
+    <div class="card"><h2>Alerts</h2><ul id="alerts"><li class="empty">None yet</li></ul></div>
+  </div>
+  <div class="card"><h2>Relative positions</h2><svg id="map" viewBox="0 0 300 300" width="100%"></svg></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<script>
+const q = new URLSearchParams(location.search);
+const P = { host: q.get("host") || "broker.hivemq.com", port: q.get("port") || "8884",
+            tls: q.get("tls") !== "false", user: q.get("user") || undefined, pass: q.get("pass") || undefined };
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const LABEL = { TOGETHER:"Together", STRAGGLER_WAITING:"Stopped behind", SEPARATED:"Separated", LOST_SIGNAL:"No signal" };
+const COLOR = { TOGETHER:"var(--ok)", STRAGGLER_WAITING:"var(--warn)", SEPARATED:"var(--bad)", LOST_SIGNAL:"var(--off)" };
+let client = null, status = null, alerts = [], lastStatusAt = 0;
+
+function setConn(on) { $("conn").style.background = on ? "var(--ok)" : "var(--off)"; $("connText").textContent = on ? "connected" : "disconnected"; }
+
+function connect() {
+  const g = $("group").value.trim();
+  if (!g || /[+#\/]/.test(g)) return;
+  if (client) client.end(true);
+  status = null; alerts = []; render(); renderAlerts();
+  client = mqtt.connect(`${P.tls ? "wss" : "ws"}://${P.host}:${P.port}/mqtt`,
+    { username: P.user, password: P.pass, clientId: "dash-" + Math.random().toString(16).slice(2, 8), reconnectPeriod: 2000 });
+  client.on("connect", () => { setConn(true); client.subscribe([`trip/${g}/status`, `trip/${g}/alerts`]); });
+  client.on("close", () => setConn(false));
+  client.on("message", (topic, payload) => {
+    let d; try { d = JSON.parse(new TextDecoder().decode(payload)); } catch { return; }
+    if (topic.endsWith("/status")) { status = d; lastStatusAt = Date.now(); render(); }
+    else if (topic.endsWith("/alerts")) { alerts.unshift(d); alerts = alerts.slice(0, 30); renderAlerts(); }
+  });
+}
+
+const REASON = { stale: "no recent data", poor_gps: "weak GPS" };
+
+function render() {
+  const rows = $("rows");
+  if (!status) { rows.innerHTML = '<tr><td colspan="6" class="empty">Waiting for data...</td></tr>'; $("map").innerHTML = ""; return; }
+  rows.innerHTML = Object.entries(status.members).sort().map(([n, m]) => `<tr>
+    <td>${esc(n)}</td>
+    <td><span class="badge" style="background:${COLOR[m.status] || "var(--off)"}">${esc(LABEL[m.status] || m.status)}</span>${m.reason ? ` <small>(${esc(REASON[m.reason] || m.reason)})</small>` : ""}</td>
+    <td>${m.distance_m == null ? "-" : esc(Math.round(m.distance_m)) + " m" + (m.nearest ? " (" + esc(m.nearest) + ")" : "")}</td>
+    <td>${m.motion_rms == null ? "?" : (m.moving ? "moving" : "still")}</td>
+    <td>${m.accuracy_m == null ? "-" : esc(Math.round(m.accuracy_m)) + " m"}</td>
+    <td>${esc(Math.round(m.age_s))} s ago</td></tr>`).join("");
+  renderMap();
+}
+
+function renderAlerts() {
+  $("alerts").innerHTML = alerts.length ? alerts.map(a =>
+    `<li class="${a.level === "warn" ? "warn" : ""}"><small>${esc(new Date(a.ts).toLocaleTimeString())}</small>${esc(a.message)}</li>`).join("")
+    : '<li class="empty">None yet</li>';
+}
+
+function renderMap() {
+  const list = Object.entries(status.members).filter(([, m]) => m.lat != null && m.status !== "LOST_SIGNAL");
+  if (!list.length) { $("map").innerHTML = ""; return; }
+  const lat0 = list.reduce((s, [, m]) => s + m.lat, 0) / list.length;
+  const lon0 = list.reduce((s, [, m]) => s + m.lon, 0) / list.length;
+  const ky = 111320, kx = 111320 * Math.cos(lat0 * Math.PI / 180);
+  const pts = {}; list.forEach(([n, m]) => pts[n] = { x: (m.lon - lon0) * kx, y: (m.lat - lat0) * ky, s: m.status, near: m.nearest });
+  const R = Math.max(status.threshold_m * 0.7, 1.15 * Math.max(...Object.values(pts).map(p => Math.hypot(p.x, p.y))));
+  const sc = 120 / R, X = p => 150 + p.x * sc, Y = p => 150 - p.y * sc;
+  let svg = "";
+  Object.values(pts).forEach(p => { const o = pts[p.near]; if (o)
+    svg += `<line x1="${X(p)}" y1="${Y(p)}" x2="${X(o)}" y2="${Y(o)}" stroke="${COLOR[p.s]}" stroke-width="1.5" stroke-dasharray="${p.s === "TOGETHER" ? "" : "4 3"}" opacity=".6"/>`; });
+  Object.entries(pts).forEach(([n, p]) => {
+    svg += `<circle cx="${X(p)}" cy="${Y(p)}" r="7" fill="${COLOR[p.s]}"/><text x="${X(p)}" y="${Y(p) - 11}" text-anchor="middle">${esc(n)}</text>`; });
+  const barLen = status.threshold_m * sc;
+  svg += `<line x1="20" y1="285" x2="${20 + barLen}" y2="285" stroke="currentColor" stroke-width="2"/><text x="20" y="276">${esc(Math.round(status.threshold_m))} m (limit)</text>`;
+  $("map").innerHTML = svg;
+}
+
+setInterval(() => { $("banner").style.display = (status && Date.now() - lastStatusAt > 6000) ? "block" : "none"; }, 1000);
+$("go").onclick = connect;
+$("group").onkeydown = e => { if (e.key === "Enter") connect(); };
+if (q.get("group")) { $("group").value = q.get("group"); connect(); }
+</script>
+</body>
+</html>
