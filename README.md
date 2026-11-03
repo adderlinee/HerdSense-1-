@@ -1,4 +1,4 @@
-# Group Travel Tracker (IoT, multicommunication + multisensor)
+# HerdSense (IoT, multicommunication + multisensor)
 
 Phones publish GPS + accelerometer data over MQTT. A detector decides who has drifted away from
 the group and sends alerts back to every phone (vibration + notification). A web dashboard shows
